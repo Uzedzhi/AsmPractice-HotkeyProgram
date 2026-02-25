@@ -6,25 +6,17 @@ org 100h
 locals @@
 
 ;-------------------------------
-; macro which moves color and character code to ax, needed for displaying it to videomemory
-; IN:		Char, Color arguments
-; OUT:		AX - initialized video "pixel"
-; DESTR:	AX
-;-------------------------------
-SETSTDCHAR MACRO Char, Color
-		mov ah, Color
-		mov al, Char
-endm
-
-;-------------------------------
 ; macro which prints "pixel" to video memory at es:[di]
 ; IN:		es:[di]		- spot where it prints
-; 			AX 			- "pixel"
+; 			Ah 			- Color argument
+;			Al			- char argument
 ; OUT:					  on screen pixel is displayed
 ; EXP:		es = 0b800h - segment of visible videomemory
 ; DESTR:	DI
 ;-------------------------------
-PRINTCHARANDINC MACRO
+PRINTCHARANDINC MACRO Char, Color
+		mov ah, Color
+		mov al, Char
 		mov word ptr es:[di], ax
 		add di, 2h
 endm
@@ -492,9 +484,11 @@ WordsEndPos			dw 0000h
 OldOffsetOf9Int     dw 00h
 OldSegmentOf9Int    dw 00h
 
-Our09func proc far
-    push ax bx cx dx si di bp ds es
+Our09func proc
+;AllRegex            db 'ax', 'bx', 'cx', 'dx', 'si', 'di', 'sp', 'bp', 'ds', 'es', 'ss', 'ip', 'cs' ; names of all the regex
+    push ss es ds bp sp di si dx cx bx ax
     cld
+	mov bp, sp						; now bp = pointer to all of regex values
 
     in al, 60h                      ; al = pressed key
     cmp al, cs:[HotKey]             ; if pressed key is Hotkey('1')
@@ -514,11 +508,15 @@ Our09func proc far
     mov al, 20h
     out 20h, al
 
-    pop es ds bp di si dx cx bx ax
+    pop ax bx cx dx si di
+	add sp, 2
+	pop bp ds es ss
     iret
 
     @@CallOld09InterruptFunc:
-    pop es ds bp di si dx cx bx ax
+    pop ax bx cx dx si di
+	add sp, 2
+	pop bp ds es ss
     jmp dword ptr cs:[OldOffsetOf9Int]
 endp
 
@@ -611,10 +609,7 @@ endp
 ; EXP:		
 ; Destroys:	cx, dx, ax, di, si
 ;------------------------------------------
-PrintFlagById proc
-    pushf
-    pop ax      ; ax = all flags in order
-    
+PrintFlagById proc    
     ; print name of flag to es:[di]
     ; name is 2 bytes
     mov si, cx
@@ -623,42 +618,36 @@ PrintFlagById proc
 
     mov dx, cs:[si]             ; dh = first symbol of the flag, dl = second
 
-    SETSTDCHAR dl, ColorCodeInner
-	PRINTCHARANDINC
+	PRINTCHARANDINC dl, ColorCodeInner
+	PRINTCHARANDINC dh, ColorCodeInner
+	PRINTCHARANDINC ':', ColorCodeInner
+	PRINTCHARANDINC ' ', ColorCodeInner
 
-    SETSTDCHAR dh, ColorCodeInner
-	PRINTCHARANDINC
-
-    SETSTDCHAR ':', ColorCodeInner
-	PRINTCHARANDINC
-
-    SETSTDCHAR ' ', ColorCodeInner
-	PRINTCHARANDINC
-
+    mov ax, ss:[bp + 26d]      ; ax = all flags in order
 
     ; printing bit corresponding to the flag
     mov si, cx
     add si, offset AllFlagsBits         ; si = адрес в памяти, где лежит то, на каком бите значение флага
-    mov si, cs:[si]                     ; si = на каком бите в регистре ax находится значение флага
-    
-    push si
-    pop cx
+
+    mov cl, cs:[si]    ; si = на каком бите в регистре ax находится значение флага
+    xor ch, ch         ; зануляем ch
 
     shr ax, cl          ; теперь первый бит в ax показывает значение нашего флага
     and ax, 01h         ; зануляем все остальные биты
 
     mov dx, ax
     add dx, '0'
-    SETSTDCHAR dl, ColorCodeInner
-    PRINTCHARANDINC
+    PRINTCHARANDINC dl, ColorCodeInner
 
     ret 
 endp
 
 
-AllRegex            db 'ax', 'bx', 'cx', 'dx', 'si', 'di', 'sp', 'bp', 'cs', 'ds', 'es', 'ss', 'ip' ; names of all the regex
+AllRegex            db 'ax', 'bx', 'cx', 'dx', 'si', 'di', 'sp', 'bp', 'ds', 'es', 'ss', 'ip', 'cs' ; names of all the regex
 AllFlags            db 'CF', 'PF', 'AF', 'ZF', 'SF', 'TF', 'IF', 'DF', 'OF' ; all flags in order of appearing in the flag register
 AllFlagsBits        db  0,    2,    4,    6,    7,    8,    9,    10,   11 ; shows which bit does this flag correspond to
+
+Previous videoframe
 
 ;------------------------------------------
 ; prints regex name and value like: ax: 0000
@@ -674,20 +663,12 @@ PrintRegexById proc
     mov si, cx
     shl si, 1                   ; si = si * 2
     add si, offset AllRegex     ; now si = address of regex name
-
     mov dx, cs:[si]             ; dh = first symbol of the regex, dl = second
 
-    SETSTDCHAR dl, ColorCodeInner
-	PRINTCHARANDINC
-
-    SETSTDCHAR dh, ColorCodeInner
-	PRINTCHARANDINC
-
-    SETSTDCHAR ':', ColorCodeInner
-	PRINTCHARANDINC
-
-    SETSTDCHAR ' ', ColorCodeInner
-	PRINTCHARANDINC
+    PRINTCHARANDINC dl, ColorCodeInner
+    PRINTCHARANDINC dh, ColorCodeInner
+    PRINTCHARANDINC ':', ColorCodeInner
+    PRINTCHARANDINC ' ', ColorCodeInner
 
     call PrintRegexValueById
 
@@ -703,82 +684,18 @@ endp
 ;------------------------------------------
 PrintRegexValueById proc
     shl cx, 1                           ; cx = cx * 2
-    mov si, cx
-    add si, offset @@MovRegexValueToDx
-    jmp word ptr cs:[si]
 
-    @@MovRegexValueToDx:
-        dw offset @@axCase
-        dw offset @@bxCase
-        dw offset @@cxCase
-        dw offset @@dxCase
-        dw offset @@siCase
-        dw offset @@diCase
-        dw offset @@spCase
-        dw offset @@bpCase
-        dw offset @@csCase
-        dw offset @@dsCase
-        dw offset @@esCase
-        dw offset @@ssCase
-        dw offset @@ipCase
-
-    @@axCase:
-        mov dx, ax
-        jmp @@Exit
-    @@bxCase:
-        mov dx, bx
-        jmp @@Exit
-    @@cxCase:
-        mov dx, cx
-        jmp @@Exit
-    @@dxCase:
-        jmp @@Exit
-    @@siCase:
-        mov dx, si
-        jmp @@Exit
-    @@diCase:
-        mov dx, di
-        jmp @@Exit
-    @@spCase:
-        push sp
-        pop dx
-        jmp @@Exit
-    @@bpCase:
-        push bp
-        pop dx
-        jmp @@Exit
-    @@csCase:
-        push cs
-        pop dx
-        jmp @@Exit
-    @@dsCase:
-        push ds
-        pop dx
-        jmp @@Exit
-    @@esCase:
-        push es
-        pop dx
-        jmp @@Exit
-    @@ssCase:
-        push ss
-        pop dx
-        jmp @@Exit
-    @@ipCase:
-        call @@GetIpValue
-        @@GetIpValue:
-        pop dx      ; got ip value
-        jmp @@Exit
-
-    @@Exit:
+	mov si, cx
+	add si, bp		; si = bp + cx * 2
+    mov dx, ss:[si]
 
 ; getting the first byte
     mov ax, dx      ; ax = dx value
     and ax, 0F000h  ; ax & 111100...000000
     shr ax, 12      ; now in al is 1st regex byte
     call ConvertFromHexToAsciiSymbol ; now cx = ascii symbol of first hex in regex
-
-    SETSTDCHAR cl, ColorCodeInner
-    PRINTCHARANDINC
+    PRINTCHARANDINC cl, ColorCodeInner
+    
 ; got it
 
 ; getting the second byte
@@ -786,9 +703,7 @@ PrintRegexValueById proc
     and ax, 00F00h  ; ax & 0000111100...0000
     shr ax, 8       ; now in al 2nd regex byte
     call ConvertFromHexToAsciiSymbol ; now cx = ascii symbol of first hex in regex
-
-    SETSTDCHAR cl, ColorCodeInner
-    PRINTCHARANDINC
+    PRINTCHARANDINC cl, ColorCodeInner
 ; got it
 
 ;getting the third byte
@@ -796,18 +711,14 @@ PrintRegexValueById proc
     and ax, 000F0h  ; ax & 0000...0011110000
     shr ax, 4       ; now in al is 3rd regex byte
     call ConvertFromHexToAsciiSymbol ; now cx = ascii symbol of first hex in regex
-
-    SETSTDCHAR cl, ColorCodeInner
-    PRINTCHARANDINC
+    PRINTCHARANDINC cl, ColorCodeInner
 ; got it
 
 ;getting the fourth byte
     mov ax, dx
     and ax, 0000Fh  ; ax & 000000...001111
     call ConvertFromHexToAsciiSymbol ; now cx = ascii symbol of first hex in regex
-
-    SETSTDCHAR cl, ColorCodeInner
-    PRINTCHARANDINC
+    PRINTCHARANDINC cl, ColorCodeInner
 ; got it
 
 endp
@@ -849,23 +760,22 @@ endp
 ; Destroys:	CX, DI, AX
 ;------------------------------------------
 PrintBorderRow proc
-push ax
+	push ax
 ; PRINT left corner
-	SETSTDCHAR al, ColorCodeBorder
-	PRINTCHARANDINC
+	PRINTCHARANDINC al, ColorCodeBorder
 ; printed
 
 ; print main border
 	mov cx, FrameLen - 2
-	SETSTDCHAR FrameCharacterTop, ColorCodeBorder
+	mov al, FrameCharacterTop
+	mov ah, ColorCodeBorder
 	rep stosw
 ; Printed
 
-pop ax
-mov al, ah
+	pop ax
+	mov al, ah
 ; print right corner
-	SETSTDCHAR al, ColorCodeBorder
-	PRINTCHARANDINC
+	PRINTCHARANDINC al, ColorCodeBorder
 ; printed
 
 	ret
@@ -879,17 +789,16 @@ endp
 ; Destroys:	CX, DI, AX
 ;------------------------------------------
 PrintNormalRow proc
-	SETSTDCHAR FrameCharacterSide, ColorCodeBorder
-	PRINTCHARANDINC
+	PRINTCHARANDINC FrameCharacterSide, ColorCodeBorder
 
     push cx
 	mov cx, FrameLen - 2
-	SETSTDCHAR ' ', ColorCodeInner
+	mov al, ' '
+	mov ah, ColorCodeInner
 	rep stosw
     pop cx
 
-	SETSTDCHAR FrameCharacterSide, ColorCodeBorder
-	PRINTCHARANDINC
+	PRINTCHARANDINC FrameCharacterSide, ColorCodeBorder
 	ret
 endp
 
@@ -904,7 +813,6 @@ endp
 ;------------------------------------------
 GetChar proc
 	mov bx, cx
-
 	repne scasb
 
 	je @@Found
