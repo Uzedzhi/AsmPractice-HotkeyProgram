@@ -6,19 +6,17 @@ org 100h
 locals @@
 
 ;-------------------------------
-; macro which prints "pixel" to video memory at es:[di]
-; IN:		es:[di]		- spot where it prints
+; macro which prints "pixel" to buffer 'SaveBuffer' with index di
+; IN:		di			- index where it prints
 ; 			Ah 			- Color argument
 ;			Al			- char argument
-; OUT:					  on screen pixel is displayed
-; EXP:		es = 0b800h - segment of visible videomemory
+; OUT:					  in buffer pixel is placed
 ; DESTR:	DI
 ;-------------------------------
 PRINTCHARANDINC MACRO Char, Color
 		mov ah, Color
 		mov al, Char
-		mov word ptr es:[di], ax
-		add di, 2h
+		stosw
 endm
 
 Start:          CLD
@@ -27,34 +25,140 @@ Start:          CLD
                 push 0
                 pop es                      ; es = 0 segment pointer
                 mov bx, 4 * 09h             ; bx = pos of 09h func in the actual memory
-                ; changing 09h interception to ours
-                CLI
+                
+					; changing 09h interception to ours
+                CLI ; cli to not get an interrupt halfway while we are changing pos
 
+; ============================saving old 9 interrupt func pos==================================
                 mov dx, es:[bx]             ; dx = Offset of 9 interrupt func
                 mov OldOffsetOf9Int, dx
                 
                 mov dx, es:[bx + 2]
                 mov OldSegmentOf9Int, dx ; saving old segment and offset values
+; ========================================Saved================================================
+; =============================initializing our interrupt func=================================
+				; if we dont have 'enable dynamic' flag enabled
+				; when we are initializing hlt program, it hlts processor when openes menushka
+				; if dynamic is enabled, menushka updates every tick.
+				; changing address of int func right from the memory.
+				; first byte is index, second is segment
+				cmp [EnabledDynamic], 01h
+				je @@InitNonHltIntFunc
+				
+				; hlt function
+                mov es:[bx], offset Our09FuncHltEdition
+				jmp @@EndOfInterruptFuncInit
 
-                mov es:[bx], offset Our09func
+				; non hlt function
+				@@InitNonHltIntFunc:
+				mov es:[bx], offset Our09FuncNonHltEdition
+
+				; second byte is segment
+				@@EndOfInterruptFuncInit:
                 mov ax, cs                  ; ax = current segment pointer
                 mov es:[bx+2], ax
-                STI
+; =============================initialized======================================================
+;===============================saving old 08 interrupt func====================================
+                mov dx, es:[bx]
+                mov OldOffsetOf8Int, dx
+                mov dx, es:[bx + 2]
+                mov OldSegmentOf8Int, dx
+; =========================================saved=================================================
+; =============================initializing our own 8 interrupt func=============================
+				; just like this 9 interrupt, we are changing 8 interrupt func to ours. 
+				; the process is as described above
+				; first byte is address
+                mov bx, 4 * 08h
+                mov es:[bx], offset Our08FuncTimerEdition
+
+				; second byte is segment
+                mov ax, cs
+                mov es:[bx + 2], ax
+; ==========================================initialized==========================================
+                sti	; now resuming interrupt signaling
 
                 mov ah, 31h                 ; ah = code of dos func to stay residient
                 mov al, 00h                 ; al = exit code of this func
                 mov dx, offset ENDOFOURFUNC
+				
                 shr dx, 4h                  ; dx = size of the program to stay residient
                 inc dx
-
                 int 21h
 
-;-------------------------------
+;----------------------------------------------------------------------------
+; this function is responsible for opening menushka without halting the processor.
+; the process is simple:
+; if menushka isnt opened, when open it and each tick our 08 interrupt will trigger, which will
+; check if there are any changes in the menushka in video memory.
+; if there are, then update buffers responsible
+; for keeping the videomemory accurate
+; and then update video memory
+; if menushka is opened
+; ignore any non hotkey scan code and wait for user to press hot key
+; once pressed, the 08 interrupt func will become "normal"(old one) and menushka will disappear from the videomemory
+;----------------------------------------------------------------------------
+Our09FuncNonHltEdition proc
+	; because it is resident interrupt func,
+	; it doesnt destroy anything
+	push ss es ds bp sp di si dx cx bx ax
+
+	; changing bp to sp to later use
+	; it to access regex values
+	mov bp, sp
+
+	; moving cs to ds
+	; it is needed to make sure then we
+	; acsess the memory our segment is right
+	push cs
+	pop ds
+	STI
+
+	cmp cs:[IsOpenMenu], 01h		; if menu is opened
+	je @@CheckIfPressedClose		; when ckeck if we pressed hotkey to close it
+
+; ==================in this section menu is not opened=======================
+    in al, 60h                      ; al = pressed key
+    cmp al, cs:[HotKey]             ; if pressed key is Hotkey('1')
+    je @@CallOpenMenushka    		; when open menushka
+	jmp @@Exit						; else call old 09 interrupt func
+; ================================section end================================
+
+; =================in this section menu is opened============================
+	@@CheckIfPressedClose:
+	in al, 60h
+	cmp al, cs:[Hotkey]				; if pressed close
+	je @@CallCloseMenushka
+	jmp @@Exit
+; ================================section end================================
+
+; ================================Opening menushka================================
+	@@CallOpenMenushka:
+	call PlaceFrameFromVMToBuffer 	; placing videomemory into buffer
+	mov cs:[IsOpenMenu], 01h		; menu is opened
+	call OpenMenushka				; opening menushka
+	jmp @@Exit
+; ================================Opened Menushka=================================
+
+; ===============================Closing Menushka=================================
+	@@CallCloseMenushka:
+	mov cs:[IsOpenMenu], 00h		; menu is closed
+	call PlaceFrameFromBufferToVM	; close menu in videomemory
+; ====================================Closed======================================
+
+	@@Exit:
+    pop ax bx cx dx si di
+	add sp, 2
+	pop bp ds es ss
+    jmp dword ptr cs:[OldOffsetOf9Int]
+	iret
+endp
+
+;--------------------------------------------------------------
 ; func which turns hex value like F to actual value at cx
 ; IN:		ds:[si] - char position
 ; OUT:		CX 		- hex value of ds[al] symbol OR -1 if not in diapason 0-9 && A-F
-; Destroys:	BX
-;-------------------------------
+; Destroys:	BX, CX
+;--------------------------------------------------------------
 ConvertToHex proc
 	; check if 0-9
 	xor bx, bx
@@ -77,28 +181,83 @@ ConvertToHex proc
 	mov cx, -1h
 	ret
 
-	@@PassedTest:
-	xor cx, cx
-	mov cx, bx
-	ret
-
+	; now in bx is value of 0-5 
 	@@PassedTesthex:
-	add bx, 0Ah
+	add bx, 0Ah		; if our char is 'A'-'F' when add 0Ah
+
+	@@PassedTest:
 	mov cx, bx
 	ret
 endp
 
-;-------------------------------
+;---------------------------------------------------------------
+; таймерное прерывание — сравнивает MenuSaveBuffer с видеопамятью.
+; При расхождении копирует изменённый символ в VmBuffer
+; и восстанавливает значение рамки в видеопамяти
+; Работает только пока меню открыто
+;---------------------------------------------------------------
+Our08FuncTimerEdition proc
+	; т.к. функция прерывания(резидентная)
+	; то сохраняем все значения регистров
+    push ds es ax bx cx dx si di
+
+    cmp cs:[IsOpenMenu], 01h 	; если меню не открыто
+    jne @@CallOld08Func			; то скипаем наше прерывания, возвращаемся к старому
+
+    push cs
+    pop ds                          ; ds = cs(для правильное адресации к памяти)
+    push 0b800h
+    pop es                          ; es = сегмент видеопамяти
+    call PlaceFrameStartToBx        ; bx = смещение левого верхнего угла рамки в видеопамяти
+    xor si, si                      ; si = индекс в буфере
+    mov dx, 11h                     ; счётчик строк
+
+    @@RowLoop:
+        mov cx, FrameLen            ; счётчик символов в строке
+        @@ColLoop:
+            mov ax, es:[bx]                          ; слово из видеопамяти
+
+            cmp ax, cs:[offset MenuSaveBuffer + si]	 ; если слово и значение в видеопамяти совпадают то 
+            je @@Same                                ; пропускаем
+
+			; иначе это означает что
+			; чужая прога нарисовала поверх нашей рамки
+			; мы должны это исправить и сначала сохранить этот
+			; инородный элемент в нашем массиве, который
+			; сохраняет все значения под рамкой(Vmbuffer), а потом
+			; восстановить рамку в видеопамяти из массива(MenuSavebuffer)
+            mov cs:[offset VmBuffer + si], ax  		; сохраняем в буфер значений под рамкой
+            mov ax, cs:[offset MenuSaveBuffer + si] ; восстанавливаем значение рамки
+			mov es:[bx], ax
+
+        	@@Same:
+            add si, 2 ;
+            add bx, 2 ; инкрементируем все индексы
+			dec cx	  ; спускаемся вних на одону строчку
+            jnz @@ColLoop ; если cx = 0 то выходим из цикла
+
+        add bx, 160d - (FrameLen * 2)   ; пропускаем остаток строки экрана
+        dec dx
+        jnz @@RowLoop
+
+    @@CallOld08Func:
+    pop di si dx cx bx ax es ds
+    jmp dword ptr cs:[OldOffsetOf8Int]  ; к старому обработчику 8 прерывания
+	iret
+endp
+
+
+;--------------------------------------------------------------
 ; func which turns 2 hex values in ascii like 4ch to actual value at cx
 ; IN:		ds:[si] - char position
 ; OUT:		CX 		- hex value of ds[al] symbol OR -1 if not in diapason 0-9 && A-F
-; Destroys:	BX, SI
-;-------------------------------
+; Destroys:	BX, SI, CX, SI(places it at the end of the hex char)
+;--------------------------------------------------------------
 Convert2BytesToHex proc
 	; first hex value
 	call ConvertToHex
 
-	cmp cx, -1h
+	cmp cx, -1h		; if not hex exti with error
 	je @@ExitFunc
 
 	shl cx, 4h ; store hex value as 00X0h
@@ -108,7 +267,7 @@ Convert2BytesToHex proc
 	inc si
 	call ConvertToHex
 
-	cmp cx, -1h
+	cmp cx, -1h		; if not hex exti with error
 	je @@ExitFuncWithPop
 
 	pop bx 		; bx = first hex value as 000X
@@ -118,10 +277,11 @@ Convert2BytesToHex proc
 	ret
 
 	@@ExitFuncWithPop:
-	pop cx
-	mov cx, -1h
+	pop cx		; popping on on the second check to clear stack
 	ret
 endp
+
+
 
 ;-------------------------------
 ; func which checks if ds:[si] Has H\h(Hex), D\d(decimal number) C\c(Char) prefix, or no prefix at all(Default is Hex)
@@ -169,49 +329,42 @@ endp
 ; if prefix is 0(None)			- gets 2 bytes in hex format
 ; IN:		ds:[si] - char
 ; OUT:		cx		- hex format of char as stated in description
-; Destroys:	si
+; Destroys:	si, DX, CX, DI
 ;-------------------------------
 GetValueFromInput proc
+	mov si, dx
 	call CheckIfHexCharorDec
 	; now in cx is identificator of our prefix
 
 	inc si ; to skip prefix
-	cmp cx, 00h
-	je @@NoPrefix
 
-	cmp cx, 01h
-	je @@HPrefix
+	mov di, cx
+	shl di, 1		; di = cx * 2
+	jmp [offset @@TableOfJumps + di]
 
-	cmp cx, 02h
-	je @@DPrefix
-
-	cmp cx, 03h
-	je @@CPrefix
-
-	; if somehow none of these values are  true, throm an ErrorS
-	mov dx, offset FatalErrorString
-	call ExitWithError
+	@@TableOfJumps:
+	dw offset @@NoPrefix
+	dw offset @@HPrefix
+	dw offset @@DPrefix
+	dw offset @@CPrefix
 
 	@@NoPrefix:
 	dec si ; if no prefix then where is nothing to skip
 	@@Hprefix:
+	@@Dprefix: ;	TODO ToDecimal
 		call Convert2BytesToHex
 		jmp @@continue
-	@@Dprefix:
-		call Convert2BytesToHex ; TODO ToDecimal
-		jmp @@continue
 	@@Cprefix:
-		mov cl, ds:[si]
+		mov cl, ds:[si]		; no need to convert, just place ascii code in the regex
 		jmp @@continue
-	
 	@@continue:
-		mov dx, offset ErrorString
+		mov dx, offset ErrorString		; init error str in case there is an error
 		cmp cx, -1h
 		je ExitWithError
+
+		mov dx, si
 		ret
-
 endp
-
 
 ;-------------------------------
 ; exits the program entirely, prints errror string to the console
@@ -220,10 +373,10 @@ endp
 ; Destroys:	program
 ;-------------------------------
 ExitWithError proc
-	mov ah, 09h
+	mov ah, 09h	; print error str
 	int 21h
 
-	mov ax, 4c00h
+	mov ax, 4c00h ; DIIIIE
 	int 21h
 	ret
 endp
@@ -240,97 +393,42 @@ endp
 ; -lb: left bottom corner (id 7)
 ; -cb: color of border (id 9)
 ; -ci: color of inner frame (id 10)
-; -s:  main string, written inside of frame (id 4)
-; IN:		ds:[si] - start of the flag
+; -so: style of the main frame(id 11)
+; -ed: enable dynamic update(id 12)
+; IN:		ds:[dl] - start of the flag
 ; OUT:		cx		- flag id
-; Destroys:	si, cx
+; Destroys:	si, cx, dx, di
 ;-------------------------------
+ArrayOfFlagNames   		db 'x', ' ', 'y', ' ', 'ft', 'fs', 'rt', 'lt', 'lb', 'rb', 'cb', 'ci', 'so', 'ed'
 IdentifyFlag proc
-	xor cx, cx
+	mov cx, 0Dh 	; amount of flags + 1
+	mov di, dx
+	mov bx, [di]	; bx = flag in command line
 
-	cmp byte ptr ds:[si], 'x'
-	je @@XposFlag
+	@@Loop:
+		test cx, cx	; if cx(counter) is zero then flag is not found
+		je @@Exit	; return with no flag
 
-	cmp byte ptr  ds:[si], 'y'
-	je @@YposFlag
+		dec cx		; decrement counter after check to check 0th index also
 
-	cmp byte ptr ds:[si], 'f'
-	je @@FrameCharFlags
+		mov si, cx
+		shl si, 1	; si = cx * 2
 
-	cmp byte ptr ds:[si], 'l'
-	je @@LeftCornerFlags
+		; comparing flag name in cmd with flag name in array
+		; if equal then we found the flag
+		cmp bx, ds:[offset ArrayOfFlagNames + si]
+		je @@LoopExit
 
-	cmp byte ptr ds:[si], 'r'
-	je @@RightCornerFlags
+		jmp @@Loop
+	@@LoopExit:
+	inc cx
+	cmp cx, 02h
+	jbe @@Exit
+	inc dx
 
-	cmp byte ptr ds:[si], 'c'
-	je @@ColorFlags
-
-	; no flags
-	@@noflags:
-	mov cx, 00h
+	@@Exit:
 	ret
-
-	@@LeftCornerFlags:
-	inc si
-	cmp byte ptr ds:[si], 't'
-	je @@LTcornerFlag
-
-	cmp byte ptr ds:[si], 'b'
-	je @@LBcornerFlag
-	jmp @@noflags
-
-	@@RightCornerFlags:
-	inc si
-	cmp byte ptr ds:[si], 't'
-	je @@RTcornerFlag
-
-	cmp byte ptr ds:[si], 'b'
-	je @@RBcornerFlag
-	jmp @@noflags
-
-	@@ColorFlags:
-	inc si
-	cmp byte ptr ds:[si], 'b'
-	je @@ColorCodeBorderFlag
-
-	cmp byte ptr ds:[si], 'i'
-	je @@ColorCodeInnerFlag
-	jmp @@noflags
-
-	@@FrameCharFlags:
-    inc si
-	cmp byte ptr ds:[si], 't'
-	je @@FrameCharTopFlag
-
-	cmp byte ptr ds:[si], 's'
-	je @@FrameCharSideFlag
-	jmp @@noflags
-
-	@@ColorCodeInnerFlag:
-	inc cx
-	@@ColorCodeBorderFlag:
-	inc cx
-	@@RBcornerFlag:
-	inc cx
-	@@LBcornerFlag:
-	inc cx
-	@@LTcornerFlag:
-	inc cx
-	@@RTcornerFlag:
-	inc cx
-	@@FrameCharSideFlag:
-	inc cx
-	@@FrameCharTopFlag:
-	inc cx
-	@@YposFlag:
-	inc cx
-	@@XposFlag:
-	inc cx
-	ret
-	
 endp
-
 
 ;----------------------------------------------------------------------------------------------
 ; this function will start parsing flags from ds:[82h] up to end of str
@@ -346,6 +444,8 @@ endp
 ; -lb: left bottom corner (id 7)
 ; -cb: color of border (id 9)
 ; -ci: color of inner frame (id 10)
+; -so: style of the main frame(id 11)
+; -ed: enable dynamic update(id 12)
 ; IN:		ds:[si] - start of the string
 ; OUT:		it will place all flag values to the specific flags
 ; 			which were placed in command line.
@@ -353,113 +453,118 @@ endp
 ; Destroys:	All variables that can change are in 'frame variables' part of consts
 ;-----------------------------------------------------------------------------------------------
 ParseAllFlags proc
-	xor ax, ax
-	mov cx, ds:[80h]		 	; cx - current len until the end of str
-	mov bx, cx					; bx is also same
+	mov dx, CommandLineStrStart ; dx = current pos in the cmd line
 
-	xor dx, dx
-	mov si, CommandLineStrStart ; si = cmdstart
+	; 81h = start of cmd
+	; [80h] = len of cmd line
+	; 81h + [80h] = end of cmd line
+	mov cl, ds:[80h]
+	mov byte ptr EndOfCmdLine, cl
+	add EndOfCmdLine, 80h
+	xor cx, cx
 
-
-	; loop of iteration across all '-' symbols found in the command line
-	; it will iterate while si < EndOfCommandLine (si < ax)
 	@@Loop:
-		mov al, ds:[80h] 		; moving strlen to the ax
-		add ax, 82h				; ax = start of cmd + strlen = end of cmd
-		cmp si, ax
-		jae @@exit
+		; comparing current pos(dx) in the cmd to the heighest value(
+		cmp dx, EndOfCmdLine
+		jae @@Exit
 
-		mov cx, ax
-		sub cx, si
+;======================get char=====================
+		mov ax, '-'				; al is symbol we try to locate
+		mov di, dx				; di is current pos in cmd string
+		mov cx, EndOfCmdLine	; cl is end of cmd line(explained above)
+		sub cx, dx				; subbing from end of line current pos in the cmd to get max len we can read from cmd
 
-		mov al, '-'		; al is symbol we try to locate
-		mov di, si		; di is cmd str
-		call GetChar
+		mov bx, cx				; saving cx to bx
+		repne scasb
+
+		sub cx, bx
+		neg cx 					; return index of the symbol '-'
+;========================done=========================
 
 		; now cx is index of that symbol
-		cmp cx, bx  ; if cx is strlen that means no symbol '-'
-		jae @@exit
+		; and we are adding to that index current pos in the cmd, so we arrive at symbol '-'
+		add dx, cx
+		dec dx
 
-		add si, cx		; si points to the '-' symbol
-		inc si
+		; if the address of the symbol we arrived at above is more than
+		; end of cmd then there is no more symbol '-'
+		cmp dx, [EndOfCmdLine]
+		jae @@Exit
 
-		call IdentifyFlag
-		; now cx has flag id
-		add si, 2h ; now si is on flag value
+		inc dx	; +1 to current pos in cmd to skip '-' symbol and get to flag name
 
-		cmp cx, 00h
-		je @@NF
+		call IdentifyFlag	; now cx = flag id
+		test cx, cx			; if cx is NF when throw an error
+		je @@NFERROR
 
-		push cx ;  flag id
-		call GetValueFromInput
-		pop bx
-		; cx = value, bx = flag id
-		cmp bx, 01h
-		je @@X
-		cmp bx, 02h
-		je @@Y
-		cmp bx, 03h
-		je @@FT
-        cmp bx, 04h
-		je @@FS
-		cmp bx, 05h
-		je @@RT
-		cmp bx, 06h
-		je @@LT
-		cmp bx, 07h
-		je @@LB
-		cmp bx, 08h
-		je @@RB
-		cmp bx, 09h
-		je @@CB
-		cmp bx, 0Ah
-		je @@CI
+		; skipping last flag char and ' ' to arrive at flag value
+		add dx, 2h
 
-    @@Exit:
-		ret
+		cmp cx, 0Bh
+		je @@StyleFlag
+		cmp cx, 0Ch
+		je @@EnabledDynamicFlag
 
-    @@NF:
-        jmp @@ExitWithNoFlagError
-    @@X:
-        mov X, cl
-        jmp @@loop
-    @@Y:
-        mov Y, cl
-        jmp @@loop
-    @@FS:
-        mov FrameCharacterSide, cl
-        jmp @@loop
-    @@FT:
-        mov FrameCharacterTop, cl
-        jmp @@loop
-    @@RT:
-        mov RTcorner, cl
-        jmp @@loop
-    @@LT:
-        mov LTcorner, cl
-        jmp @@loop
-    @@LB:
-        mov LBcorner, cl
-        jmp @@loop
-    @@RB:
-        mov RBcorner, cl
-        jmp @@loop
-    @@CB:
-        mov ColorCodeBorder, cl
-        jmp @@loop
-    @@CI:
-        mov ColorCodeInner, cl
-        jmp @@loop
+		push cx					; pushing flag id
+		call GetValueFromInput	; get that value
+								; now cl = flag value
+		pop si 					; popping flag id, si = flag id
 
-	@@ExitWithNoFlagError:
+		; now we are placing our value(cl)  into the desired variable/
+		; all variables are located in DATA segment and sorted by rising of flag id
+		; for example. 'X' has flag id 1 so its placed in the code as 1st variable
+		; so if we write to address of X + flag id when we will write into variable orf that same flag id
+		mov [offset X + si - 1], cl	
+		jmp @@Loop
+
+	    @@StyleFlag:
+		call GetValueFromStyleFlag
+		jmp @@Loop
+
+		@@EnabledDynamicFlag:
+		mov [EnabledDynamic], 01h
+		jmp @@Loop
+
+	@@NFERROR:
 		mov dx, offset NoFlagErrorStr
 		call ExitWithError
+	@@Exit:
 		ret
 
 endp
+; CX - flag id
+; DX - current pos at the flag value 
+GetValueFromStyleFlag proc
+	push di bx
+
+	mov di, NumOfFlags
+	@@Loop:
+		test di, di
+		je @@Exit
+
+		dec di
+		push di
+		call GetValueFromInput	; get that value
+		pop di
+		
+		; now cl = flag value
+		mov bx, offset X + NumOfFlags - 1
+		sub bx, di
+		mov cs:[bx], cl
+		inc dx
+		jmp @@Loop
+
+	@@Exit:
+	pop bx di
+	ret
+endp
+
+; ============================================DATA SEGMENT========================================================
+OldOffsetOf8Int     dw 00h
+OldSegmentOf8Int    dw 00h
 
 ; error strings
-ErrorString			db 'ERROR: you typed incorrect command line prompt, correct usage: <program name>.com <X> <Y> <Framecharacter> <LTcorner> <RTcorner> <RBcorner> <LBcorner> <Colorcode1> <Colorcode2>$'
+ErrorString			db 'ERROR: you typed incorrect command line prompt, correct usage: <program name>.com -<flag name> <flag value> ... -<flag name> <flag value>$'
 ErrorStringPos		db 'ERROR: you typed incorrect X or Y pos values. they should in diapason 00h <= X <= 90h, 00h <= Y <= 21h$'
 FatalErrorString	db 'ERROR: fatal$'
 NoFlagErrorStr		db 'ERROR: invalid flag. please use one of the accepted flags.$'
@@ -468,62 +573,179 @@ NoFlagErrorStr		db 'ERROR: invalid flag. please use one of the accepted flags.$'
 HotKey              db 02h      ; '1'
 X                   db 28h
 Y                   db 05h
-FrameCharacterSide	db '#'
 FrameCharacterTop   db '#'
+FrameCharacterSide	db '#'
+RTcorner			db '#'
 LTcorner			db '#'
 LBcorner			db '#'
-RTcorner			db '#'
 RBcorner			db '#'
 ColorCodeBorder		db 7Eh
 ColorCodeInner		db 70h
+EnabledDynamic		db 00h
+
 FrameLen            equ 12h     ; 12h to fit perfectly all regex and flags
 CommandLineStrStart	equ 82h
 WordsEndPos			dw 0000h
+EndOfCmdLine		dw 0000h
 
 ; Old interrupt func location
 OldOffsetOf9Int     dw 00h
 OldSegmentOf9Int    dw 00h
+NumOfFlags			equ 0Ah
 
-Our09func proc
-;AllRegex            db 'ax', 'bx', 'cx', 'dx', 'si', 'di', 'sp', 'bp', 'ds', 'es', 'ss', 'ip', 'cs' ; names of all the regex
+
+
+; SaveBuffer is an array which holds previous video segment data.
+; It is used only for opening menushka with hlt
+; it is initialized to perfectly fit in the frame 18x17 pixels, 2 bytes for each pixel
+IsOpenMenu			db 00h
+SaveBuffer 			db FrameLen * 17 * 2 dup(0) 
+MenuSaveBuffer 		db FrameLen * 17 * 2 dup(0) 
+VmBuffer 			db FrameLen * 17 * 2 dup(0) 
+
+;========================================================END OF DATA SEGMENT========================================================
+
+;----------------------------------------------------------------------------------------
+; эта функция оборачивает стандартную функцию прерывания 9h
+; и ждет пока пользователь нажмет на горячую клавишу.
+; По нажатию открывается менюшка с регистрами и процессор останавливает
+; свою работу, но продолжает слушать прерывания.
+; Когда он поймает еще прерывание с нажатием той же горячец клавиши,
+; он закроет менюшку и продолжит работу как ни в чем не бывало.
+; Открытие многоразовое
+;----------------------------------------------------------------------------------------
+Our09FuncHltEdition proc
     push ss es ds bp sp di si dx cx bx ax
-    cld
-	mov bp, sp						; now bp = pointer to all of regex values
+	mov bp, sp
 
+	cmp cs:[IsOpenMenu], 01h		; if menu is opened
+	je @@CheckIfPressedClose		; when ckeck if we pressed hotkey to close it
+
+; ==================in this section menu is not opened=======================
     in al, 60h                      ; al = pressed key
     cmp al, cs:[HotKey]             ; if pressed key is Hotkey('1')
-    jne @@CallOld09InterruptFunc    ; when open menushka else goto old func
+    je @@CallOpenMenushka    		; when open menushka
+	jmp @@CallOld09Func				; else call old 09 interrupt func
+; ================================section end================================
 
-    push cs
-    pop ds                          ; ds = current segment pointer
-    call OpenMenushka
+; =================in this section menu is opened============================
+	@@CheckIfPressedClose:
+	in al, 60h
+	cmp al, cs:[Hotkey]		; if pressed close
+	je @@CallCloseMenushka
+	call BlinkBit
+	jmp @@Exit
+; ================================section end================================
 
-    in al, 61h                      ; al = значение, полученное от чтение 61 порта(клавиатуры)
-    mov ah, al                      ; ah = дублирует al
-    or al, 80h                      ; al = значение из порта, но с установленным битиком(битом блокировки клавиатуры)
-    out 61h, al                     ; запускаем этот бит в порт 61h
-    mov al, ah                      ; al = восстанавливаем ah
-    out 61h, al                     ; запускаем в порт значение с разблокировкой клавиатуры
+; ================================Opening menushka================================
+	@@CallOpenMenushka:
+	push cs
+	pop ds
+	call PlaceFrameFromVMToBuffer 	; placing videomemory into buffer
+	mov cs:[IsOpenMenu], 01h		; menu is opened
+	call OpenMenushka				; opening menushka
+	call BlinkBit					; blink to signal we ended our interrupt
+; ================================Opened Menushka=================================
 
-    mov al, 20h
-    out 20h, al
+; =================cycle waiting for hotkey to be presed again====================
+	sti
+	@@IntLoop:
+		hlt
 
-    pop ax bx cx dx si di
+		cmp cs:[IsOpenMenu], 00h
+		jne @@IntLoop
+	; if we are out of the cycle it means that user pressed hotkey
+	; again and closed the menushka. So we can peacefully exit the func
+	jmp @@Exit
+; ===================================cycled=======================================
+
+	@@CallCloseMenushka:
+	call PlaceFrameFromBufferToVM
+	mov cs:[IsOpenMenu], 00h
+	call BlinkBit
+
+	@@Exit:
+	pop ax bx cx dx si di
 	add sp, 2
 	pop bp ds es ss
     iret
 
-    @@CallOld09InterruptFunc:
+	@@CallOld09Func:
     pop ax bx cx dx si di
 	add sp, 2
 	pop bp ds es ss
     jmp dword ptr cs:[OldOffsetOf9Int]
+	iret
+
 endp
 
-OpenMenushka proc
-    push 0b800h
-    pop es                         ; es = videomemory segment
+;------------------------------------------------------------------
+; Копирует прямоугольник экрана ПОД будущей рамкой в массив buffer
+; OUT:		сохраняет в массив SaveBuffer 17x18x2 байт значений пикселей экрана
+;------------------------------------------------------------------
+PlaceFrameFromVMToBuffer proc
+	push ds es bx si di cx
+    cld
+    call PlaceFrameStartToBx    ; Теперь bx = адрес верхнего левого угла рамки
 
+    push 0b800h
+    pop ds                      ; ds = Сегмент видеопамяти
+    push cs
+    pop es                      ; es = сегмент кода
+
+    mov si, bx                  ; SI указывает на экран
+    mov di, offset VmBuffer
+
+    mov dx, 17d
+	@@RowLoop:
+	    mov cx, FrameLen
+	    rep movsw                   
+
+	    add si, 160d - (FrameLen * 2) ; переходим на новую строку
+
+	    dec dx
+	    jnz @@RowLoop
+	pop cx di si bx es ds
+    ret
+endp
+
+;------------------------------------------------------------------
+; Копирует значения пикселей из буфера в видеопамять, затирая рамку
+; и сохраняя последнюю версию открытой программы
+; OUT:		сохраняет в массив 17x18x2 байт значений пикселей экрана
+;------------------------------------------------------------------
+PlaceFrameFromBufferToVM proc
+	push ds es bx si di cx
+    cld
+    call PlaceFrameStartToBx    ; Теперь bx = адрес верхнего левого угла рамки
+
+    push 0b800h
+    pop es                      ; ds = Сегмент видеопамяти
+    push cs
+    pop ds                      ; es = сегмент кода
+
+    mov si, offset VmBuffer     ; si = указатель на массив
+    mov di, bx					; di = указатель на экран
+
+    mov dx, 17d
+	@@RowLoop:
+	    mov cx, FrameLen
+	    rep movsw                 
+
+	    add di, 160d - (FrameLen * 2) 
+
+	    dec dx
+	    jnz @@RowLoop
+	pop cx di si bx es ds
+    ret
+endp
+
+;---------------------------------------------------------------
+; ложит в bx индекс, на который нужно сместиться от начала видео памяти чтобы попасть на Y строку и X пиксель в этой строке
+; EXP:		X, Y - x and y coordinates
+; DESTR:	bx, ax, dx
+;---------------------------------------------------------------
+PlaceFrameStartToBx proc
 ; placing bx = Y * RowLen + X * 2 (pos of top left corner of the frame)
 	xor bx, bx			; bx = 0
 	mov bl, X			; bx = X
@@ -535,14 +757,91 @@ OpenMenushka proc
 	mul dx				; ax = Y * RowLen
 	add bx, ax			; bx = bx + ax (bx = X * 2 + Y * Rowlen)
 ; placed
+endp
 
+
+;---------------------------------------------------------------
+; эта функция моргает битиком в 61h прерывание чтобы
+; сигнализировать что мы закончили обрабатывать прерывание и готовы принять следующее
+;---------------------------------------------------------------
+BlinkBit proc
+	in al, 61h                      ; al = значение, полученное от чтение 61 порта(клавиатуры)
+    mov ah, al                      ; ah = дублирует al
+    or al, 80h                      ; al = значение из порта, но с установленным битиком(битом блокировки клавиатуры)
+    out 61h, al                     ; запускаем этот бит в порт 61h
+    mov al, ah                      ; al = восстанавливаем ah
+    out 61h, al                     ; запускаем в порт значение с разблокировкой клавиатуры
+
+    mov al, 20h
+    out 20h, al
+	ret
+endp
+
+;---------------------------------------------------------------
+; функция открывает менюшку в видеопамяти.
+; она выводит все регистры и флаги, из значения и названия.
+; пример выводы менюшки:
+;
+; 				##################
+; 				# ax: 0000 CF: 0 #
+; 				# bx: 0000 PF: 1 #
+; 				# cx: 0005 AF: 0 #
+; 				# dx: fd88 ZF: 0 #
+; 				# si: c98d SF: 0 #
+; 				# di: 9a8d TF: 0 #
+; 				# sp: 9183 IF: 1 #
+; 				# bp: 2134 DF: 0 #
+; 				# ds: 3443 OF: 0 #
+; 				# es: 0123	   	 #
+; 				# ss: 01EF	   	 #
+; 				# ip: 034D	   	 #
+; 				# cs: 019E	   	 #
+; 				##################
+; рамка кастомизируется переменными, расположенными в 
+; data segment под комментарием frame variables
+; DESTR: ax, di, bx, cx, es, si
+;---------------------------------------------------------------
+OpenMenushka proc
+	call PrintMenushkaToSaveBuffer
+
+	push ds es bx si di cx
+    cld
+    call PlaceFrameStartToBx    ; Теперь bx = адрес верхнего левого угла рамки
+
+    push 0b800h
+    pop es                      ; ds = Сегмент видеопамяти
+    push cs
+    pop ds                      ; es = сегмент кода
+
+    mov si, offset MenuSaveBuffer     ; si = указатель на массив
+    mov di, bx					; di = указатель на экран
+
+    mov dx, 17d
+	@@RowLoop:
+	    mov cx, FrameLen
+	    rep movsw                 
+
+	    add di, 160d - (FrameLen * 2) 
+
+	    dec dx
+	    jnz @@RowLoop
+	pop cx di si bx es ds
+    ret
+
+	ret
+endp
+
+PrintMenushkaToSaveBuffer proc
+	mov bx, offset MenuSaveBuffer
+	push cs
+	pop es
     mov al, LTcorner
 	mov ah, RTcorner
 
     mov di, bx
     call PrintBorderRow
 
-    add bx, 80d * 2
+    add bx, FrameLen * 2
     mov di, bx
     call PrintNormalRow
 
@@ -552,8 +851,7 @@ OpenMenushka proc
         cmp cx, 0Dh
         je @@ExitLoop
 
-
-        add bx, 80d * 2
+        add bx, FrameLen * 2
         mov di, bx
         call PrintNormalRow
 
@@ -582,23 +880,24 @@ OpenMenushka proc
     @@ExitLoop:
 ; done printing
 
-
-
-    add bx, 80d * 2
+; ==========================Print Normal Row========================
+    add bx, FrameLen * 2
     mov di, bx
     mov cx, dx
     call PrintNormalRow
+; ========================Printed========================
 
+; ========================Print Border row========================
     mov al, LBcorner
 	mov ah, RBcorner
 
-    add bx, 80d * 2
+    add bx, FrameLen * 2
     mov di, bx
     mov cx, dx
     call PrintBorderRow
+; ========================printed========================
 
     ret
-
 endp
 
 ;------------------------------------------
@@ -643,11 +942,12 @@ PrintFlagById proc
 endp
 
 
+; regex and glaf names, needed for later pprinting
 AllRegex            db 'ax', 'bx', 'cx', 'dx', 'si', 'di', 'sp', 'bp', 'ds', 'es', 'ss', 'ip', 'cs' ; names of all the regex
 AllFlags            db 'CF', 'PF', 'AF', 'ZF', 'SF', 'TF', 'IF', 'DF', 'OF' ; all flags in order of appearing in the flag register
 AllFlagsBits        db  0,    2,    4,    6,    7,    8,    9,    10,   11 ; shows which bit does this flag correspond to
-
-Previous videoframe
+;	/\
+; tells which bit of flag regex does the flag above correspond to
 
 ;------------------------------------------
 ; prints regex name and value like: ax: 0000
@@ -802,33 +1102,5 @@ PrintNormalRow proc
 	ret
 endp
 
-;------------------------------------------
-; finds the al symbol in string es:di, returns index (reads no more than cx symbols)
-; IN:		ES:DI - source string
-; 			AL	  - symbol
-;			CX	  - string len
-; OUT:		CX    - symbol position
-; EXP:		DF 	  = 0
-; Destroys:	DI, BX
-;------------------------------------------
-GetChar proc
-	mov bx, cx
-	repne scasb
-
-	je @@Found
-	; delimiter not found
-	sub cx, bx
-	neg cx ; no delimiter found, so return string len
-	ret
-
-	@@Found:
-	; delimiter found:
-	sub cx, bx
-	neg cx
-	dec cx ; if delimiter found we substract its len from the answer to get actual index
-	ret
-endp
-
 ENDOFOURFUNC:
-
 end Start
