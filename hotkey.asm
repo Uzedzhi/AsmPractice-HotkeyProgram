@@ -21,16 +21,46 @@ endm
 
 Start:          CLD
 	            call ParseAllFlags
+;----------------------------------------------------------------
+; this block makes it so our program wont open a second time
+; at the start of each interrupt function we have a construction
+; similar to this:
+;   	jmp @@SkipHeader
+;		db 'ITS_MY_TSR_INTRUDER'
+;		@@SkipHeader:
+;----------------------------------------------------------------
+; ===================Exit if segment of old interrupt func is the default one==================
+				; get current interrupt segment and offset
+				; into es:[bx]
+				mov ax, 3509h
+				int 21h					
+				; because repe cmpsb compares strings from es:[di] to ds:[si]
+				; we should place old segment and offset to es:[di]
+				
+				; es is already installed
+				mov di, bx					; in di is offset of current 09 int func
+				add di, 2                   ; sip 2 bytes from 'jmp short' instruction
 
-                push 0
+				mov si, offset HeaderStr    ; DS:SI points to our signature
+				xor cx, cx
+				mov cl, HeaderLen           ; CX = len of signature
+
+				repe cmpsb                  ; compare cx bytes from ES:DI to DS:SI
+				jne @@DontExitProgram       ; if found mismatch - dont exit program, it means our int func has not been placed yet
+
+				mov dx, offset ProgramIsAlreadyRunningErrorString
+				sti
+				call ExitWithError          ; EOP because we try to place to of the same residents
+				@@DontExitProgram:
+; =================================Exited or continuing========================================
+; ============================saving old 9 interrupt func pos==================================
+				push 0
                 pop es                      ; es = 0 segment pointer
                 mov bx, 4 * 09h             ; bx = pos of 09h func in the actual memory
                 
 					; changing 09h interception to ours
                 CLI ; cli to not get an interrupt halfway while we are changing pos
-
-; ============================saving old 9 interrupt func pos==================================
-                mov dx, es:[bx]             ; dx = Offset of 9 interrupt func
+                mov dx, es:[bx]             ; dx = segment of 9 interrupt func
                 mov OldOffsetOf9Int, dx
                 
                 mov dx, es:[bx + 2]
@@ -45,6 +75,7 @@ Start:          CLD
 				cmp [EnabledDynamic], 01h
 				je @@InitNonHltIntFunc
 				
+				mov bx, 4 * 09h
 				; hlt function
                 mov es:[bx], offset Our09FuncHltEdition
 				jmp @@EndOfInterruptFuncInit
@@ -59,6 +90,7 @@ Start:          CLD
                 mov es:[bx+2], ax
 ; =============================initialized======================================================
 ;===============================saving old 08 interrupt func====================================
+                mov bx, 4 * 08h
                 mov dx, es:[bx]
                 mov OldOffsetOf8Int, dx
                 mov dx, es:[bx + 2]
@@ -68,7 +100,6 @@ Start:          CLD
 				; just like this 9 interrupt, we are changing 8 interrupt func to ours. 
 				; the process is as described above
 				; first byte is address
-                mov bx, 4 * 08h
                 mov es:[bx], offset Our08FuncTimerEdition
 
 				; second byte is segment
@@ -85,6 +116,8 @@ Start:          CLD
                 inc dx
                 int 21h
 
+
+IsHalted	db 00h
 ;----------------------------------------------------------------------------
 ; this function is responsible for opening menushka without halting the processor.
 ; the process is simple:
@@ -98,6 +131,9 @@ Start:          CLD
 ; once pressed, the 08 interrupt func will become "normal"(old one) and menushka will disappear from the videomemory
 ;----------------------------------------------------------------------------
 Our09FuncNonHltEdition proc
+	jmp short @@SkipHeader
+	db 'ITS_MY_TSR_INTRUDER'
+	@@SkipHeader:
 	; because it is resident interrupt func,
 	; it doesnt destroy anything
 	push ss es ds bp sp di si dx cx bx ax
@@ -128,9 +164,26 @@ Our09FuncNonHltEdition proc
 	in al, 60h
 	cmp al, cs:[Hotkey]				; if pressed close
 	je @@CallCloseMenushka
+	cmp al, cs:[HltHotKey]
+	je @@HltUntilNextHltHotKey
 	jmp @@Exit
 ; ================================section end================================
 
+	@@HltUntilNextHltHotKey:
+	cmp cs:[IsHalted], 00h
+	je @@SkipExit
+	mov cs:[IsHalted], 00h
+	jmp @@Exit
+	@@SkipExit:
+	mov cs:[IsHalted], 01h
+	
+	sti
+	@@Loop:
+		hlt
+
+		cmp [IsHalted], 00h
+		je @@Exit
+		jmp @@Loop
 ; ================================Opening menushka================================
 	@@CallOpenMenushka:
 	call PlaceFrameFromVMToBuffer 	; placing videomemory into buffer
@@ -197,9 +250,10 @@ endp
 ; Работает только пока меню открыто
 ;---------------------------------------------------------------
 Our08FuncTimerEdition proc
+	push ss es ds bp sp di si dx cx bx ax
+	mov bp, sp
 	; т.к. функция прерывания(резидентная)
 	; то сохраняем все значения регистров
-    push ds es ax bx cx dx si di
 
     cmp cs:[IsOpenMenu], 01h 	; если меню не открыто
     jne @@CallOld08Func			; то скипаем наше прерывания, возвращаемся к старому
@@ -240,9 +294,12 @@ Our08FuncTimerEdition proc
         dec dx
         jnz @@RowLoop
 
+	call OpenMenushka
     @@CallOld08Func:
-    pop di si dx cx bx ax es ds
-    jmp dword ptr cs:[OldOffsetOf8Int]  ; к старому обработчику 8 прерывания
+    pop ax bx cx dx si di
+	add sp, 2
+	pop bp ds es ss
+    jmp dword ptr cs:[OldOffsetOf8Int]  ; цепочка к старому обработчику
 	iret
 endp
 
@@ -564,13 +621,19 @@ OldOffsetOf8Int     dw 00h
 OldSegmentOf8Int    dw 00h
 
 ; error strings
-ErrorString			db 'ERROR: you typed incorrect command line prompt, correct usage: <program name>.com -<flag name> <flag value> ... -<flag name> <flag value>$'
-ErrorStringPos		db 'ERROR: you typed incorrect X or Y pos values. they should in diapason 00h <= X <= 90h, 00h <= Y <= 21h$'
-FatalErrorString	db 'ERROR: fatal$'
-NoFlagErrorStr		db 'ERROR: invalid flag. please use one of the accepted flags.$'
+ErrorString							db 'ERROR: you typed incorrect command line prompt, correct usage: <program name>.com -<flag name> <flag value> ... -<flag name> <flag value>$'
+ErrorStringPos						db 'ERROR: you typed incorrect X or Y pos values. they should in diapason 00h <= X <= 90h, 00h <= Y <= 21h$'
+FatalErrorString					db 'ERROR: fatal$'
+ProgramIsAlreadyRunningErrorString	db 'ERROR: program is already running in resident mode$'
+NoFlagErrorStr						db 'ERROR: invalid flag. please use one of the accepted flags.$'
+
+; header string
+HeaderStr							db 'ITS_MY_TSR_INTRUDER'
+HeaderLen							db 13h
 
 ; frame variables
-HotKey              db 02h      ; '1'
+HltHotKey			db 1Bh
+HotKey              db 1Ah
 X                   db 28h
 Y                   db 05h
 FrameCharacterTop   db '#'
@@ -615,6 +678,9 @@ VmBuffer 			db FrameLen * 17 * 2 dup(0)
 ; Открытие многоразовое
 ;----------------------------------------------------------------------------------------
 Our09FuncHltEdition proc
+	jmp short @@SkipHeader
+	db 'ITS_MY_TSR_INTRUDER'
+	@@SkipHeader:
     push ss es ds bp sp di si dx cx bx ax
 	mov bp, sp
 
@@ -674,7 +740,7 @@ Our09FuncHltEdition proc
     pop ax bx cx dx si di
 	add sp, 2
 	pop bp ds es ss
-    jmp dword ptr cs:[OldOffsetOf9Int]
+    jmp dword ptr cs:[OldSegmentOf9Int]
 	iret
 
 endp
