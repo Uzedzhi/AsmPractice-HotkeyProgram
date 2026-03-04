@@ -67,19 +67,13 @@ Start:          CLD
                 mov OldSegmentOf9Int, dx ; saving old segment and offset values
 ; ========================================Saved================================================
 ; =============================initializing our interrupt func=================================
-				; if we dont have 'enable dynamic' flag enabled
-				; when we are initializing hlt program, it hlts processor when openes menushka
-				; if dynamic is enabled, menushka updates every tick.
+				; menushka updates every tick.
 				; changing address of int func right from the memory.
 				; first byte is index, second is segment
 				cmp [EnabledDynamic], 01h
 				je @@InitNonHltIntFunc
 				
 				mov bx, 4 * 09h
-				; hlt function
-                mov es:[bx], offset Our09FuncHltEdition
-				jmp @@EndOfInterruptFuncInit
-
 				; non hlt function
 				@@InitNonHltIntFunc:
 				mov es:[bx], offset Our09FuncNonHltEdition
@@ -117,7 +111,6 @@ Start:          CLD
                 int 21h
 
 
-IsHalted	db 00h
 ;----------------------------------------------------------------------------
 ; this function is responsible for opening menushka without halting the processor.
 ; the process is simple:
@@ -131,9 +124,6 @@ IsHalted	db 00h
 ; once pressed, the 08 interrupt func will become "normal"(old one) and menushka will disappear from the videomemory
 ;----------------------------------------------------------------------------
 Our09FuncNonHltEdition proc
-	jmp short @@SkipHeader
-	db 'ITS_MY_TSR_INTRUDER'
-	@@SkipHeader:
 	; because it is resident interrupt func,
 	; it doesnt destroy anything
 	push ss es ds bp sp di si dx cx bx ax
@@ -176,6 +166,7 @@ Our09FuncNonHltEdition proc
 	jmp @@Exit
 	@@SkipExit:
 	mov cs:[IsHalted], 01h
+	call BlinkBit
 	
 	sti
 	@@Loop:
@@ -188,6 +179,7 @@ Our09FuncNonHltEdition proc
 	@@CallOpenMenushka:
 	call PlaceFrameFromVMToBuffer 	; placing videomemory into buffer
 	mov cs:[IsOpenMenu], 01h		; menu is opened
+	
 	call OpenMenushka				; opening menushka
 	jmp @@Exit
 ; ================================Opened Menushka=================================
@@ -199,6 +191,7 @@ Our09FuncNonHltEdition proc
 ; ====================================Closed======================================
 
 	@@Exit:
+	call BlinkBit
     pop ax bx cx dx si di
 	add sp, 2
 	pop bp ds es ss
@@ -264,10 +257,15 @@ Our08FuncTimerEdition proc
     pop es                          ; es = сегмент видеопамяти
     call PlaceFrameStartToBx        ; bx = смещение левого верхнего угла рамки в видеопамяти
     xor si, si                      ; si = индекс в буфере
-    mov dx, 11h                     ; счётчик строк
+
+	; dx - счётчик строк
+	; всего в рамке 2 строки границы
+	; 2 строки без регитров
+	; и 13 строк с регистрами
+    mov dx, 11h                     
 
     @@RowLoop:
-        mov cx, FrameLen            ; счётчик символов в строке
+        mov cx, FrameLen            				 ; счётчик символов в строке
         @@ColLoop:
             mov ax, es:[bx]                          ; слово из видеопамяти
 
@@ -456,9 +454,9 @@ endp
 ; OUT:		cx		- flag id
 ; Destroys:	si, cx, dx, di
 ;-------------------------------
-ArrayOfFlagNames   		db 'x', ' ', 'y', ' ', 'ft', 'fs', 'rt', 'lt', 'lb', 'rb', 'cb', 'ci', 'so', 'ed'
+ArrayOfFlagNames   		db 'x', ' ', 'y', ' ', 'ft', 'fs', 'rt', 'lt', 'lb', 'rb', 'cb', 'ci', 'so'
 IdentifyFlag proc
-	mov cx, 0Dh 	; amount of flags + 1
+	mov cx, 0Ch 	; amount of flags + 1
 	mov di, dx
 	mov bx, [di]	; bx = flag in command line
 
@@ -559,8 +557,6 @@ ParseAllFlags proc
 
 		cmp cx, 0Bh
 		je @@StyleFlag
-		cmp cx, 0Ch
-		je @@EnabledDynamicFlag
 
 		push cx					; pushing flag id
 		call GetValueFromInput	; get that value
@@ -576,10 +572,6 @@ ParseAllFlags proc
 
 	    @@StyleFlag:
 		call GetValueFromStyleFlag
-		jmp @@Loop
-
-		@@EnabledDynamicFlag:
-		mov [EnabledDynamic], 01h
 		jmp @@Loop
 
 	@@NFERROR:
@@ -632,6 +624,7 @@ HeaderStr							db 'ITS_MY_TSR_INTRUDER'
 HeaderLen							db 13h
 
 ; frame variables
+IsHalted			db 00h
 HltHotKey			db 1Bh
 HotKey              db 1Ah
 X                   db 28h
@@ -654,7 +647,7 @@ EndOfCmdLine		dw 0000h
 ; Old interrupt func location
 OldOffsetOf9Int     dw 00h
 OldSegmentOf9Int    dw 00h
-NumOfFlags			equ 0Ah
+NumOfFlags			equ 09h
 
 
 
@@ -667,83 +660,6 @@ MenuSaveBuffer 		db FrameLen * 17 * 2 dup(0)
 VmBuffer 			db FrameLen * 17 * 2 dup(0) 
 
 ;========================================================END OF DATA SEGMENT========================================================
-
-;----------------------------------------------------------------------------------------
-; эта функция оборачивает стандартную функцию прерывания 9h
-; и ждет пока пользователь нажмет на горячую клавишу.
-; По нажатию открывается менюшка с регистрами и процессор останавливает
-; свою работу, но продолжает слушать прерывания.
-; Когда он поймает еще прерывание с нажатием той же горячец клавиши,
-; он закроет менюшку и продолжит работу как ни в чем не бывало.
-; Открытие многоразовое
-;----------------------------------------------------------------------------------------
-Our09FuncHltEdition proc
-	jmp short @@SkipHeader
-	db 'ITS_MY_TSR_INTRUDER'
-	@@SkipHeader:
-    push ss es ds bp sp di si dx cx bx ax
-	mov bp, sp
-
-	cmp cs:[IsOpenMenu], 01h		; if menu is opened
-	je @@CheckIfPressedClose		; when ckeck if we pressed hotkey to close it
-
-; ==================in this section menu is not opened=======================
-    in al, 60h                      ; al = pressed key
-    cmp al, cs:[HotKey]             ; if pressed key is Hotkey('1')
-    je @@CallOpenMenushka    		; when open menushka
-	jmp @@CallOld09Func				; else call old 09 interrupt func
-; ================================section end================================
-
-; =================in this section menu is opened============================
-	@@CheckIfPressedClose:
-	in al, 60h
-	cmp al, cs:[Hotkey]		; if pressed close
-	je @@CallCloseMenushka
-	call BlinkBit
-	jmp @@Exit
-; ================================section end================================
-
-; ================================Opening menushka================================
-	@@CallOpenMenushka:
-	push cs
-	pop ds
-	call PlaceFrameFromVMToBuffer 	; placing videomemory into buffer
-	mov cs:[IsOpenMenu], 01h		; menu is opened
-	call OpenMenushka				; opening menushka
-	call BlinkBit					; blink to signal we ended our interrupt
-; ================================Opened Menushka=================================
-
-; =================cycle waiting for hotkey to be presed again====================
-	sti
-	@@IntLoop:
-		hlt
-
-		cmp cs:[IsOpenMenu], 00h
-		jne @@IntLoop
-	; if we are out of the cycle it means that user pressed hotkey
-	; again and closed the menushka. So we can peacefully exit the func
-	jmp @@Exit
-; ===================================cycled=======================================
-
-	@@CallCloseMenushka:
-	call PlaceFrameFromBufferToVM
-	mov cs:[IsOpenMenu], 00h
-	call BlinkBit
-
-	@@Exit:
-	pop ax bx cx dx si di
-	add sp, 2
-	pop bp ds es ss
-    iret
-
-	@@CallOld09Func:
-    pop ax bx cx dx si di
-	add sp, 2
-	pop bp ds es ss
-    jmp dword ptr cs:[OldSegmentOf9Int]
-	iret
-
-endp
 
 ;------------------------------------------------------------------
 ; Копирует прямоугольник экрана ПОД будущей рамкой в массив buffer
@@ -823,6 +739,7 @@ PlaceFrameStartToBx proc
 	mul dx				; ax = Y * RowLen
 	add bx, ax			; bx = bx + ax (bx = X * 2 + Y * Rowlen)
 ; placed
+	ret
 endp
 
 
@@ -868,9 +785,13 @@ endp
 ; DESTR: ax, di, bx, cx, es, si
 ;---------------------------------------------------------------
 OpenMenushka proc
-	call PrintMenushkaToSaveBuffer
+	cmp cs:[IsHalted], 01h      ; Проверяем, нажат ли HltHotKey
+    je @@SkipRedrawBuffer       ; Если остановлен - НЕ обновляем цифры регистров
+    
+    call PrintMenushkaToSaveBuffer
 
-	push ds es bx si di cx
+    @@SkipRedrawBuffer:
+
     cld
     call PlaceFrameStartToBx    ; Теперь bx = адрес верхнего левого угла рамки
 
@@ -891,10 +812,7 @@ OpenMenushka proc
 
 	    dec dx
 	    jnz @@RowLoop
-	pop cx di si bx es ds
     ret
-
-	ret
 endp
 
 PrintMenushkaToSaveBuffer proc
@@ -1086,6 +1004,7 @@ PrintRegexValueById proc
     call ConvertFromHexToAsciiSymbol ; now cx = ascii symbol of first hex in regex
     PRINTCHARANDINC cl, ColorCodeInner
 ; got it
+	ret
 
 endp
 
